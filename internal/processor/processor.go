@@ -11,6 +11,10 @@ import (
 	"strings"
 )
 
+type scopeState struct {
+	fill string
+}
+
 type Result struct {
 	Legend []LegendItem
 	SVG    []byte
@@ -35,7 +39,9 @@ var numRe = regexp.MustCompile(`[-+]?(?:\d*\.?\d+)`)
 func ProcessSVG(input []byte) (*Result, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(input))
 	gradients := map[string]string{}
+	classFill := map[string]string{}
 	var shapes []shape
+	stack := []scopeState{{}}
 
 	for {
 		tok, err := decoder.Token()
@@ -45,24 +51,39 @@ func ProcessSVG(input []byte) (*Result, error) {
 			}
 			return nil, err
 		}
-		start, ok := tok.(xml.StartElement)
-		if !ok {
-			continue
-		}
-		tag := strings.ToLower(start.Name.Local)
-		switch tag {
-		case "lineargradient", "radialgradient":
-			id := getAttr(start.Attr, "id")
-			if id == "" {
+		switch t := tok.(type) {
+		case xml.StartElement:
+			tag := strings.ToLower(t.Name.Local)
+			attrs := attrsMap(t.Attr)
+
+			inherited := stack[len(stack)-1].fill
+			currentFill := fillFromAttrs(attrs, classFill)
+			if currentFill == "" {
+				currentFill = inherited
+			}
+			stack = append(stack, scopeState{fill: currentFill})
+
+			switch tag {
+			case "style":
+				if css, err := readInlineStyle(decoder, t); err == nil {
+					for k, v := range parseClassFillStyles(css) {
+						classFill[k] = v
+					}
+				}
 				continue
-			}
-			color, err := readGradientColor(decoder, start)
-			if err == nil && color != "" {
-				gradients[id] = normalizeColor(color)
-			}
-		case "rect", "circle", "ellipse", "path", "polygon", "polyline", "line":
-			attrs := attrsMap(start.Attr)
-			color := detectFill(attrs)
+			case "lineargradient", "radialgradient":
+				id := getAttr(t.Attr, "id")
+				if id == "" {
+					continue
+				}
+				color, err := readGradientColor(decoder, t)
+				if err == nil && color != "" {
+					gradients[id] = normalizeColor(color)
+				}
+				stack = stack[:len(stack)-1]
+				continue
+			case "rect", "circle", "ellipse", "path", "polygon", "polyline", "line":
+				color := currentFill
 			if strings.HasPrefix(color, "url(#") && strings.HasSuffix(color, ")") {
 				id := strings.TrimSuffix(strings.TrimPrefix(color, "url(#"), ")")
 				color = gradients[id]
@@ -73,6 +94,11 @@ func ProcessSVG(input []byte) (*Result, error) {
 			}
 			cx, cy := estimateCenter(tag, attrs)
 			shapes = append(shapes, shape{Tag: tag, Attrs: attrs, Color: color, CenterX: cx, CenterY: cy})
+			}
+		case xml.EndElement:
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+			}
 		}
 	}
 	if len(shapes) == 0 {
@@ -217,14 +243,54 @@ func parsePoints(s string) [][2]float64 {
 	return pts
 }
 
-func detectFill(attrs map[string]string) string {
+func fillFromAttrs(attrs map[string]string, classFill map[string]string) string {
 	if v := attrs["fill"]; v != "" {
 		return v
 	}
 	if v := styleValue(attrs["style"], "fill"); v != "" {
 		return v
 	}
+	if cls := strings.TrimSpace(attrs["class"]); cls != "" {
+		for _, c := range strings.Fields(cls) {
+			if v := classFill[c]; v != "" {
+				return v
+			}
+		}
+	}
 	return ""
+}
+
+func readInlineStyle(decoder *xml.Decoder, start xml.StartElement) (string, error) {
+	var b strings.Builder
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		switch t := tok.(type) {
+		case xml.CharData:
+			b.Write([]byte(t))
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return b.String(), nil
+			}
+		}
+	}
+}
+
+func parseClassFillStyles(css string) map[string]string {
+	out := map[string]string{}
+	ruleRe := regexp.MustCompile(`(?s)\.([a-zA-Z0-9_-]+)\s*\{([^}]*)\}`)
+	matches := ruleRe.FindAllStringSubmatch(css, -1)
+	for _, m := range matches {
+		if len(m) < 3 {
+			continue
+		}
+		if fill := styleValue(m[2], "fill"); fill != "" {
+			out[m[1]] = fill
+		}
+	}
+	return out
 }
 
 func styleValue(style, key string) string {
