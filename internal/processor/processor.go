@@ -34,6 +34,13 @@ type shape struct {
 	CenterY float64
 }
 
+type canvas struct {
+	MinX   float64
+	MinY   float64
+	Width  float64
+	Height float64
+}
+
 var numRe = regexp.MustCompile(`[-+]?(?:\d*\.?\d+)`)
 
 func ProcessSVG(input []byte) (*Result, error) {
@@ -42,6 +49,7 @@ func ProcessSVG(input []byte) (*Result, error) {
 	classFill := map[string]string{}
 	var shapes []shape
 	stack := []scopeState{{}}
+	cv := canvas{MinX: 0, MinY: 0, Width: 210, Height: 297}
 
 	for {
 		tok, err := decoder.Token()
@@ -55,6 +63,9 @@ func ProcessSVG(input []byte) (*Result, error) {
 		case xml.StartElement:
 			tag := strings.ToLower(t.Name.Local)
 			attrs := attrsMap(t.Attr)
+			if tag == "svg" {
+				cv = canvasFromSVG(attrs)
+			}
 
 			inherited := stack[len(stack)-1].fill
 			currentFill := fillFromAttrs(attrs, classFill)
@@ -120,7 +131,7 @@ func ProcessSVG(input []byte) (*Result, error) {
 		shapes[i].Number = colorNum[shapes[i].Color]
 	}
 
-	out := buildOutputSVG(shapes, colors)
+	out := buildOutputSVG(shapes, colors, cv)
 	legend := make([]LegendItem, 0, len(colors))
 	for i, c := range colors {
 		legend = append(legend, LegendItem{Number: i + 1, Color: c})
@@ -154,11 +165,13 @@ func readGradientColor(decoder *xml.Decoder, start xml.StartElement) (string, er
 	}
 }
 
-func buildOutputSVG(shapes []shape, colors []string) []byte {
+func buildOutputSVG(shapes []shape, colors []string, cv canvas) []byte {
+	legendHeight := 58.0
+	totalHeight := cv.Height + legendHeight
 	var b strings.Builder
-	b.WriteString(`<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 210 297">`)
-	b.WriteString(`<rect x="0" y="0" width="210" height="297" fill="white"/>`)
-	b.WriteString(`<g transform="translate(10,10) scale(0.9)">`)
+	b.WriteString(fmt.Sprintf(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.4f %.4f %.4f %.4f">`, cv.MinX, cv.MinY, cv.Width, totalHeight))
+	b.WriteString(fmt.Sprintf(`<rect x="%.4f" y="%.4f" width="%.4f" height="%.4f" fill="white"/>`, cv.MinX, cv.MinY, cv.Width, totalHeight))
+	b.WriteString(`<g>`)
 	for _, s := range shapes {
 		b.WriteString(`<` + s.Tag)
 		for k, v := range s.Attrs {
@@ -172,20 +185,58 @@ func buildOutputSVG(shapes []shape, colors []string) []byte {
 		b.WriteString(fmt.Sprintf(`<text x="%.2f" y="%.2f" font-size="4" text-anchor="middle" dominant-baseline="middle">%d</text>`, s.CenterX, s.CenterY, s.Number))
 	}
 	b.WriteString(`</g>`)
-	b.WriteString(`<line x1="10" y1="245" x2="200" y2="245" stroke="black" stroke-width="0.5"/>`)
-	b.WriteString(`<text x="10" y="252" font-size="5" font-weight="bold">Легенда цветов</text>`)
-	y := 258.0
+	legendTop := cv.MinY + cv.Height + 6
+	b.WriteString(fmt.Sprintf(`<line x1="%.4f" y1="%.4f" x2="%.4f" y2="%.4f" stroke="black" stroke-width="0.5"/>`, cv.MinX, legendTop, cv.MinX+cv.Width, legendTop))
+	b.WriteString(fmt.Sprintf(`<text x="%.4f" y="%.4f" font-size="5" font-weight="bold">Легенда цветов</text>`, cv.MinX+2, legendTop+7))
+	y := legendTop + 14
 	for i, c := range colors {
-		b.WriteString(fmt.Sprintf(`<rect x="10" y="%.1f" width="7" height="5" fill="white" stroke="black"/>`, y-4))
-		b.WriteString(fmt.Sprintf(`<text x="13.5" y="%.1f" font-size="3" text-anchor="middle" dominant-baseline="middle">%d</text>`, y-1.5, i+1))
-		b.WriteString(fmt.Sprintf(`<text x="20" y="%.1f" font-size="4">%d = %s</text>`, y, i+1, c))
+		b.WriteString(fmt.Sprintf(`<rect x="%.4f" y="%.4f" width="7" height="5" fill="%s" stroke="black"/>`, cv.MinX+2, y-4, c))
+		b.WriteString(fmt.Sprintf(`<text x="%.4f" y="%.1f" font-size="3" text-anchor="middle" dominant-baseline="middle">%d</text>`, cv.MinX+5.5, y-1.5, i+1))
+		b.WriteString(fmt.Sprintf(`<text x="%.4f" y="%.1f" font-size="4">%d = %s</text>`, cv.MinX+12, y, i+1, c))
 		y += 7
-		if y > 294 {
+		if y > cv.MinY+totalHeight-2 {
 			break
 		}
 	}
 	b.WriteString(`</svg>`)
 	return []byte(b.String())
+}
+
+func canvasFromSVG(attrs map[string]string) canvas {
+	if vb := strings.TrimSpace(attrs["viewbox"]); vb != "" {
+		parts := strings.Fields(strings.ReplaceAll(vb, ",", " "))
+		if len(parts) == 4 {
+			minX, ex1 := strconv.ParseFloat(parts[0], 64)
+			minY, ex2 := strconv.ParseFloat(parts[1], 64)
+			w, ex3 := strconv.ParseFloat(parts[2], 64)
+			h, ex4 := strconv.ParseFloat(parts[3], 64)
+			if ex1 == nil && ex2 == nil && ex3 == nil && ex4 == nil && w > 0 && h > 0 {
+				return canvas{MinX: minX, MinY: minY, Width: w, Height: h}
+			}
+		}
+	}
+	w := parseLength(attrs["width"])
+	h := parseLength(attrs["height"])
+	if w > 0 && h > 0 {
+		return canvas{MinX: 0, MinY: 0, Width: w, Height: h}
+	}
+	return canvas{MinX: 0, MinY: 0, Width: 210, Height: 297}
+}
+
+func parseLength(v string) float64 {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	n := numRe.FindString(v)
+	if n == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(n, 64)
+	if err != nil || math.IsNaN(f) || f <= 0 {
+		return 0
+	}
+	return f
 }
 
 func estimateCenter(tag string, attrs map[string]string) (float64, float64) {
